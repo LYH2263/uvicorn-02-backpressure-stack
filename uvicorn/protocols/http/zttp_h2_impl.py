@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import logging
-import sys
 from collections.abc import Callable, Generator
 from typing import Any, ClassVar, Literal
 from urllib.parse import unquote
@@ -22,7 +20,16 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
-from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
+from uvicorn.protocols.backpressure import (
+    BASELINE_POLICY,
+    CYCLE_DONE,
+    SIBLINGS_CLEAR,
+    BackpressurePolicy,
+    BackpressureStack,
+    EffectivePolicy,
+    start_bound_task,
+)
+from uvicorn.protocols.http.flow_control import FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
 
@@ -70,6 +77,7 @@ class ZttpH2Protocol(asyncio.Protocol):
         # Per-connection state
         self.transport: asyncio.Transport = None  # type: ignore[assignment]
         self.flow: FlowControl = None  # type: ignore[assignment]
+        self.backpressure = BackpressureStack()
         self.server: tuple[str, int | None] | None = None
         self.client: tuple[str, int] | None = None
         self.scheme: Literal["http", "https"] | None = None
@@ -171,7 +179,9 @@ class ZttpH2Protocol(asyncio.Protocol):
                 cycle.body += event.data
                 # Unreachable until zttp grows its 64 KiB inbound flow-control
                 # windows, which cap how much body can buffer per stream.
-                if len(cycle.body) > HIGH_WATER_LIMIT:  # pragma: no cover
+                # The limit is this stream's merged view: a per-stream inner
+                # frame must never leak onto a sibling stream.
+                if len(cycle.body) > cycle.effective_policy().inbound_high_water:  # pragma: no cover
                     self.flow.pause_reading()
                 cycle.message_event.set()
             elif isinstance(event, zttp.EndOfMessage):
@@ -229,28 +239,41 @@ class ZttpH2Protocol(asyncio.Protocol):
         else:
             app = self.app
 
+        subscribed = app is not service_unavailable
         cycle = RequestResponseCycle(
             scope=scope,
             conn=self.conn,
             stream=self.conn.stream(event.stream_id),
             transport=self.transport,
             flow=self.flow,
+            backpressure=self.backpressure,
+            subscribed=subscribed,
             logger=self.logger,
             access_logger=self.access_logger,
             access_log=self.access_log,
             default_headers=self.server_state.default_headers,
             message_event=asyncio.Event(),
             on_response=self.on_response_complete,
-            resume_reading=self.resume_reading_if_idle,
+            resume_reading=lambda: self.request_resume_reading(cycle),
         )
         self.cycles[event.stream_id] = cycle
 
-        if self.config.reset_contextvars:
-            if sys.version_info >= (3, 11):  # pragma: py-lt-311
-                task = self.loop.create_task(cycle.run_asgi(app), context=contextvars.Context())
-            else:  # pragma: py-gte-311
-                task = contextvars.Context().run(self.loop.create_task, cycle.run_asgi(app))
+        self._start_asgi_task(cycle, app)
+
+    def _start_asgi_task(self, cycle: RequestResponseCycle, app: ASGI3Application) -> None:
+        if cycle.subscribed:
+            # Bind the connection stack; the cycle's own frame list is the
+            # inner stream layer only this task can push to.
+            task = start_bound_task(
+                self.loop,
+                cycle.run_asgi(app),
+                self.backpressure,
+                reset_contextvars=self.config.reset_contextvars,
+                stream_frames=cycle.stream_policies,
+            )
         else:
+            # The limit_concurrency 503 (and shutdown 503) path does not
+            # subscribe to the backpressure stack.
             task = self.loop.create_task(cycle.run_asgi(app))
         task.add_done_callback(self.tasks.discard)
         self.tasks.add(task)
@@ -265,13 +288,26 @@ class ZttpH2Protocol(asyncio.Protocol):
         self.on_stream_closed()
 
     def resume_reading_if_idle(self) -> None:
-        """Resume reads only if no stream is over the body buffer high-water
-        mark; otherwise a slow stream's buffer would keep growing while a fast
-        peer ships frames on a sibling stream."""
+        """Resume reads only if no stream is over *its own* merged body buffer
+        high-water mark; otherwise a slow stream's buffer would keep growing
+        while a fast peer ships frames on a sibling stream."""
         for cycle in self.cycles.values():
-            if len(cycle.body) > HIGH_WATER_LIMIT:
+            if len(cycle.body) > cycle.effective_policy().inbound_high_water:
                 return
         self.flow.resume_reading()
+
+    def request_resume_reading(self, cycle: RequestResponseCycle) -> None:
+        """Resume request coming from ``cycle.receive()``; honors the gate of
+        this stream's merged view."""
+        gate = cycle.effective_policy().resume_gate
+        if gate == CYCLE_DONE:
+            # HTTP/1.x habit: this stream drained its body, try resuming now.
+            self.flow.resume_reading()
+        else:
+            # Unset gate keeps the historical HTTP/2 default: wait until every
+            # surviving sibling stream is below its own effective watermark.
+            assert gate in (None, SIBLINGS_CLEAR)
+            self.resume_reading_if_idle()
 
     def on_response_complete(self, stream_id: int) -> None:
         self.server_state.total_requests += 1
@@ -283,8 +319,13 @@ class ZttpH2Protocol(asyncio.Protocol):
             return
 
         # The stream's body buffer is gone, so it can no longer hold back the
-        # read side of the transport.
-        self.resume_reading_if_idle()
+        # read side of the transport. The gate visible here is the connection
+        # stack's: any per-stream inner frame left with the ended cycle.
+        gate = self.backpressure.view().resume_gate
+        if gate == CYCLE_DONE:
+            self.flow.resume_reading()
+        else:
+            self.resume_reading_if_idle()
 
         self._unset_keepalive_if_required()
 
@@ -343,6 +384,8 @@ class RequestResponseCycle:
         stream: zttp.Stream,
         transport: asyncio.Transport,
         flow: FlowControl,
+        backpressure: BackpressureStack,
+        subscribed: bool,
         logger: logging.Logger,
         access_logger: logging.Logger,
         access_log: bool,
@@ -356,6 +399,10 @@ class RequestResponseCycle:
         self.stream = stream
         self.transport = transport
         self.flow = flow
+        self.backpressure = backpressure
+        # The limit_concurrency 503 / shutdown 503 cycle never reads the
+        # policy stack: those paths are unrelated to transport backpressure.
+        self.subscribed = subscribed
         self.logger = logger
         self.access_logger = access_logger
         self.access_log = access_log
@@ -363,6 +410,10 @@ class RequestResponseCycle:
         self.message_event = message_event
         self.on_response = on_response
         self.resume_reading = resume_reading
+
+        # Frames pushed inside this stream only. Sibling streams on the same
+        # connection have their own list and never read these frames.
+        self.stream_policies: list[BackpressurePolicy] = []
 
         # Connection state
         self.disconnected = False
@@ -379,6 +430,11 @@ class RequestResponseCycle:
         self.trailers: list[tuple[bytes, bytes]] = []
         self.bodyless = False
         self.expected_content_length: int | None = None
+
+    def effective_policy(self) -> EffectivePolicy:
+        if not self.subscribed:
+            return BASELINE_POLICY
+        return self.backpressure.view(self.stream_policies)
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -434,7 +490,7 @@ class RequestResponseCycle:
 
     # ASGI interface
     async def send(self, message: ASGISendEvent) -> None:
-        if self.flow.write_paused and not self.disconnected:
+        if self.effective_policy().write_await and self.flow.write_paused and not self.disconnected:
             await self.flow.drain()  # pragma: no cover
 
         if self.disconnected:

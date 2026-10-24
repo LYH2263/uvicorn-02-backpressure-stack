@@ -27,6 +27,7 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
+from uvicorn.protocols.backpressure import EffectivePolicy
 from uvicorn.protocols.utils import (
     ClientDisconnected,
     get_client_addr,
@@ -60,6 +61,7 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         server_state: ServerState,
         app_state: dict[str, Any],
         _loop: asyncio.AbstractEventLoop | None = None,
+        backpressure: EffectivePolicy | None = None,
     ) -> None:
         if not config.loaded:
             config.load()  # pragma: no cover
@@ -71,6 +73,11 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         self.root_path = config.root_path
         self.asgi_version = config.asgi_version
         self.app_state = app_state
+
+        # Frozen backpressure view captured at HTTP -> WebSocket upgrade time.
+        # WebSockets keep their writable-Event model (never FlowControl); only
+        # the ASGI send wait on the write side follows this snapshot.
+        self.write_await = True if backpressure is None else backpressure.write_await
 
         # Shared server state
         self.connections = server_state.connections
@@ -430,7 +437,8 @@ class WebSocketsSansIOProtocol(asyncio.Protocol):
         self.transport.write(b"".join(output))
 
     async def send(self, message: ASGISendEvent) -> None:
-        await self.writable.wait()
+        if self.write_await:
+            await self.writable.wait()
 
         if self.disconnected:
             raise ClientDisconnected()

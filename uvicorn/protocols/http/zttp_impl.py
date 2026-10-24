@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import logging
-import sys
 from collections.abc import Callable
 from typing import Any, Literal
 from urllib.parse import unquote
@@ -21,6 +19,7 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
+from uvicorn.protocols.backpressure import BASELINE_POLICY, BackpressureStack, EffectivePolicy, start_bound_task
 from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
@@ -62,6 +61,7 @@ class ZttpProtocol(asyncio.Protocol):
         # Per-connection state
         self.transport: asyncio.Transport = None  # type: ignore[assignment]
         self.flow: FlowControl = None  # type: ignore[assignment]
+        self.backpressure = BackpressureStack()
         self.server: tuple[str, int | None] | None = None
         self.client: tuple[str, int] | None = None
         self.scheme: Literal["http", "https"] | None = None
@@ -142,6 +142,25 @@ class ZttpProtocol(asyncio.Protocol):
         except zttp.RemoteProtocolError:
             self.handle_remote_protocol_error()
 
+    def _inbound_high_water(self) -> int:
+        # The limit_concurrency 503 cycle does not subscribe to the stack.
+        if self.cycle is not None and not self.cycle.subscribed:
+            return HIGH_WATER_LIMIT
+        return self.backpressure.view().inbound_high_water
+
+    def _start_asgi_task(self, cycle: RequestResponseCycle, app: ASGI3Application) -> None:
+        if cycle.subscribed:
+            task = start_bound_task(
+                self.loop,
+                cycle.run_asgi(app),
+                self.backpressure,
+                reset_contextvars=self.config.reset_contextvars,
+            )
+        else:
+            task = self.loop.create_task(cycle.run_asgi(app))
+        task.add_done_callback(self.tasks.discard)
+        self.tasks.add(task)
+
     def handle_events(self, event: zttp.Event) -> None:
         while event is not zttp.NEED_DATA:
             if isinstance(event, zttp.Request):
@@ -189,6 +208,8 @@ class ZttpProtocol(asyncio.Protocol):
                     conn=self.conn,
                     transport=self.transport,
                     flow=self.flow,
+                    backpressure=self.backpressure,
+                    subscribed=app is not service_unavailable,
                     logger=self.logger,
                     access_logger=self.access_logger,
                     access_log=self.access_log,
@@ -200,20 +221,12 @@ class ZttpProtocol(asyncio.Protocol):
                 if event.end_stream:
                     self.cycle.more_body = False
                     self.cycle.message_event.set()
-                if self.config.reset_contextvars:
-                    if sys.version_info >= (3, 11):  # pragma: py-lt-311
-                        task = self.loop.create_task(self.cycle.run_asgi(app), context=contextvars.Context())
-                    else:  # pragma: py-gte-311
-                        task = contextvars.Context().run(self.loop.create_task, self.cycle.run_asgi(app))
-                else:
-                    task = self.loop.create_task(self.cycle.run_asgi(app))
-                task.add_done_callback(self.tasks.discard)
-                self.tasks.add(task)
+                self._start_asgi_task(self.cycle, app)
 
             elif isinstance(event, zttp.Data):
                 if self.cycle is not None and not self.cycle.response_complete:
                     self.cycle.body += event.data
-                    if len(self.cycle.body) > HIGH_WATER_LIMIT:
+                    if len(self.cycle.body) > self._inbound_high_water():
                         self.flow.pause_reading()
                     self.cycle.message_event.set()
 
@@ -245,6 +258,7 @@ class ZttpProtocol(asyncio.Protocol):
             config=self.config,
             server_state=self.server_state,
             app_state=self.app_state,
+            backpressure=self.backpressure.snapshot(),
         )
         protocol.connection_made(self.transport)
         protocol.data_received(bytes(output))
@@ -324,6 +338,8 @@ class RequestResponseCycle:
         conn: zttp.H1Connection,
         transport: asyncio.Transport,
         flow: FlowControl,
+        backpressure: BackpressureStack,
+        subscribed: bool,
         logger: logging.Logger,
         access_logger: logging.Logger,
         access_log: bool,
@@ -336,6 +352,10 @@ class RequestResponseCycle:
         self.conn = conn
         self.transport = transport
         self.flow = flow
+        self.backpressure = backpressure
+        # The limit_concurrency 503 cycle never reads the policy stack: the
+        # 503 path is unrelated to transport backpressure.
+        self.subscribed = subscribed
         self.logger = logger
         self.access_logger = access_logger
         self.access_log = access_log
@@ -358,6 +378,11 @@ class RequestResponseCycle:
         self.bodyless = False
         self.chunked_encoding = False
         self.expected_content_length = 0
+
+    def effective_policy(self) -> EffectivePolicy:
+        if not self.subscribed:
+            return BASELINE_POLICY
+        return self.backpressure.view()
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -407,7 +432,7 @@ class RequestResponseCycle:
 
     # ASGI interface
     async def send(self, message: ASGISendEvent) -> None:
-        if self.flow.write_paused and not self.disconnected:
+        if self.effective_policy().write_await and self.flow.write_paused and not self.disconnected:
             await self.flow.drain()  # pragma: no cover
 
         if self.disconnected:

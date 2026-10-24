@@ -28,6 +28,7 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config, UvicornDeprecationWarning
 from uvicorn.logging import TRACE_LOG_LEVEL
+from uvicorn.protocols.backpressure import EffectivePolicy
 from uvicorn.protocols.utils import (
     ClientDisconnected,
     get_client_addr,
@@ -69,6 +70,7 @@ class WebSocketProtocol(WebSocketServerProtocol):
         server_state: ServerState,
         app_state: dict[str, Any],
         _loop: asyncio.AbstractEventLoop | None = None,
+        backpressure: EffectivePolicy | None = None,
     ):
         if not config.loaded:
             config.load()
@@ -79,6 +81,11 @@ class WebSocketProtocol(WebSocketServerProtocol):
         self.root_path = config.root_path
         self.asgi_version = config.asgi_version
         self.app_state = app_state
+
+        # Frozen backpressure view captured at HTTP -> WebSocket upgrade time.
+        # This implementation keeps the library's writable waiter (never
+        # FlowControl); the snapshot only decides whether writes await it.
+        self.write_await = True if backpressure is None else backpressure.write_await
 
         # Shared server state
         self.connections = server_state.connections
@@ -148,6 +155,12 @@ class WebSocketProtocol(WebSocketServerProtocol):
         super().connection_lost(exc)
         if exc is None:
             self.transport.close()
+
+    async def drain(self) -> None:  # type: ignore[override]
+        # The library's writable waiter stays the backpressure mechanism; the
+        # upgrade-time snapshot only decides whether ASGI writes await it.
+        if self.write_await:
+            await super().drain()
 
     def shutdown(self) -> None:
         self.ws_server.closing = True

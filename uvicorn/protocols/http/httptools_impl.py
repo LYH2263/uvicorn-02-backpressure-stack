@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import http
 import logging
 import re
-import sys
 import urllib
 from asyncio.events import TimerHandle
 from collections import deque
@@ -23,6 +21,7 @@ from uvicorn._types import (
 )
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
+from uvicorn.protocols.backpressure import BASELINE_POLICY, BackpressureStack, EffectivePolicy, start_bound_task
 from uvicorn.protocols.http.flow_control import HIGH_WATER_LIMIT, FlowControl, service_unavailable
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
@@ -86,6 +85,7 @@ class HttpToolsProtocol(asyncio.Protocol):
         # Per-connection state
         self.transport: asyncio.Transport = None  # type: ignore[assignment]
         self.flow: FlowControl = None  # type: ignore[assignment]
+        self.backpressure = BackpressureStack()
         self.server: tuple[str, int | None] | None = None
         self.client: tuple[str, int] | None = None
         self.scheme: Literal["http", "https"] | None = None
@@ -198,6 +198,7 @@ class HttpToolsProtocol(asyncio.Protocol):
             config=self.config,
             server_state=self.server_state,
             app_state=self.app_state,
+            backpressure=self.backpressure.snapshot(),
         )
         protocol.connection_made(self.transport)
         protocol.data_received(b"".join(output))
@@ -279,6 +280,8 @@ class HttpToolsProtocol(asyncio.Protocol):
             scope=self.scope,
             transport=self.transport,
             flow=self.flow,
+            backpressure=self.backpressure,
+            subscribed=app is not service_unavailable,
             logger=self.logger,
             access_logger=self.access_logger,
             access_log=self.access_log,
@@ -297,14 +300,13 @@ class HttpToolsProtocol(asyncio.Protocol):
             self.pipeline.appendleft((self.cycle, app))
 
     def _start_asgi_task(self, cycle: RequestResponseCycle, app: ASGI3Application) -> None:
-        if self.config.reset_contextvars:
-            # Opt-in workaround for https://github.com/python/cpython/issues/140947:
-            # asyncio can leak context vars between tasks. Hides context set in the
-            # lifespan or by external instrumentation.
-            if sys.version_info >= (3, 11):  # pragma: py-lt-311
-                task = self.loop.create_task(cycle.run_asgi(app), context=contextvars.Context())
-            else:  # pragma: py-gte-311
-                task = contextvars.Context().run(self.loop.create_task, cycle.run_asgi(app))
+        if cycle.subscribed:
+            task = start_bound_task(
+                self.loop,
+                cycle.run_asgi(app),
+                self.backpressure,
+                reset_contextvars=self.config.reset_contextvars,
+            )
         else:
             task = self.loop.create_task(cycle.run_asgi(app))
         task.add_done_callback(self.tasks.discard)
@@ -314,9 +316,15 @@ class HttpToolsProtocol(asyncio.Protocol):
         if (self.parser.should_upgrade() and self._should_upgrade()) or self.cycle.response_complete:
             return
         self.cycle.body += body
-        if len(self.cycle.body) > HIGH_WATER_LIMIT:
+        if len(self.cycle.body) > self._inbound_high_water():
             self.flow.pause_reading()
         self.cycle.message_event.set()
+
+    def _inbound_high_water(self) -> int:
+        # The limit_concurrency 503 cycle does not subscribe to the stack.
+        if self.cycle is not None and not self.cycle.subscribed:
+            return HIGH_WATER_LIMIT
+        return self.backpressure.view().inbound_high_water
 
     def on_message_complete(self) -> None:
         if (self.parser.should_upgrade() and self._should_upgrade()) or self.cycle.response_complete:
@@ -382,6 +390,8 @@ class RequestResponseCycle:
         scope: HTTPScope,
         transport: asyncio.Transport,
         flow: FlowControl,
+        backpressure: BackpressureStack,
+        subscribed: bool,
         logger: logging.Logger,
         access_logger: logging.Logger,
         access_log: bool,
@@ -394,6 +404,10 @@ class RequestResponseCycle:
         self.scope = scope
         self.transport = transport
         self.flow = flow
+        self.backpressure = backpressure
+        # The limit_concurrency 503 cycle never reads the policy stack: the
+        # 503 path is unrelated to transport backpressure.
+        self.subscribed = subscribed
         self.logger = logger
         self.access_logger = access_logger
         self.access_log = access_log
@@ -415,6 +429,11 @@ class RequestResponseCycle:
         self.response_complete = False
         self.chunked_encoding: bool | None = None
         self.expected_content_length = 0
+
+    def effective_policy(self) -> EffectivePolicy:
+        if not self.subscribed:
+            return BASELINE_POLICY
+        return self.backpressure.view()
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -461,7 +480,7 @@ class RequestResponseCycle:
 
     # ASGI interface
     async def send(self, message: ASGISendEvent) -> None:
-        if self.flow.write_paused and not self.disconnected:
+        if self.effective_policy().write_await and self.flow.write_paused and not self.disconnected:
             await self.flow.drain()  # pragma: full coverage
 
         if self.disconnected:
